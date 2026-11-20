@@ -25,7 +25,7 @@ from app.main import app  # noqa: E402
 @pytest.fixture()
 def client():
     service.ensure_db()
-    service.reset_all()
+    service.purge_all()  # 连同清空记录/墓碑一起抹掉，每个用例从全新库开始
     with TestClient(app) as c:
         yield c
 

@@ -24,3 +24,27 @@ class SaveError(DomainError):
 
     def __init__(self, message: str = "保存失败，已回滚，仍沿用原清单"):
         super().__init__(message, 500)
+
+
+class ClearedIdempotencyKeyError(DomainError):
+    """该幂等键对应的交印单已被清空，不能再次出单或改动共需清单。"""
+
+    def __init__(self, idem_key: str):
+        super().__init__(
+            f"该笔交印已清空（幂等键 {idem_key}），不能重复出单，共需清单未改动",
+            409,
+        )
+
+
+class OrderNotFoundError(DomainError):
+    """单号不存在，或该单所属数据已被清空。"""
+
+    def __init__(self, order_no: str):
+        super().__init__(f"单据不存在：{order_no}（可能已被清空）", 404)
+
+
+class ClearFailureError(SaveError):
+    """清空失败：整笔回滚，原单仍可查询和复用。"""
+
+    def __init__(self, message: str = "清空失败，已回滚，原单仍可查询和复用"):
+        super().__init__(message)

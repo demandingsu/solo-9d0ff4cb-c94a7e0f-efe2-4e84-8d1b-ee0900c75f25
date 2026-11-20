@@ -89,17 +89,32 @@
 
     <div class="card">
       <h2>④ 按单号重取原单</h2>
+      <p class="muted">清空工位后旧单号即失效，取 JSON / 下载 CSV 都会提示“单据不存在”。</p>
       <label>单号</label>
-      <input type="text" id="orderNo" placeholder="例如：MO20261120-000001">
+      <input type="text" id="orderNo" placeholder="例如：MO20261120-000001 或 MO20261120-G1-000001">
       <button class="ghost" onclick="fetchOrder()">查看 JSON</button>
       <button class="ghost" onclick="downloadOrder()">下载 CSV</button>
       <div id="orderMsg" class="msg"></div>
     </div>
 
     <div class="card">
+      <h2>⑤ 清空工位（演示）</h2>
+      <p class="muted">删除字库、分册与旧单内容；旧单号和旧幂等键永久失效，
+        当天重新出首单会进入新世代（单号带 G{n}），不会沿用旧号。</p>
+      <button class="ghost" onclick="resetAll()">清空工位</button>
+      <label style="margin-top:12px">清空失败演练（原单仍可查询/复用）</label>
+      <button class="ghost" onclick="resetAllFailing()">模拟清空失败</button>
+      <div id="resetMsg" class="msg"></div>
+    </div>
+
+    <div class="card">
       <h2>演示辅助</h2>
-      <button class="ghost" onclick="resetAll()">清空全部数据</button>
       <button class="ghost" onclick="loadState()">刷新右侧状态</button>
+      <div class="muted" style="margin-top:8px">
+        演示清空与重取：① 交印记下单号并填到“按单号重取” → ② 清空工位 →
+        ③ 旧单号取 JSON/CSV 均提示不存在 → ④ 重新上传再交印得到新号 →
+        ⑤ 用旧幂等键再交印提示“该笔交印已清空”。
+      </div>
     </div>
   </div>
 
@@ -128,7 +143,11 @@ function show(id, text, ok) {
 async function post(url, formData, headers) {
   const resp = await fetch(url, { method:"POST", body: formData, headers: headers || {} });
   const data = await resp.json();
-  if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+  if (!resp.ok) {
+    const err = new Error(data.error || ("HTTP " + resp.status));
+    err.type = data.type; err.status = resp.status;
+    throw err;
+  }
   return data;
 }
 async function uploadLib() {
@@ -171,8 +190,15 @@ async function submitVol() {
       `共需字模：${d.pool_before.length} → ${d.pool_after.length}`];
     show("submitMsg", lines.join("\n"), true);
     document.getElementById("rawBox").textContent = JSON.stringify(d, null, 2);
+    // 方便直接演示“旧链接失效”：交印后自动填入单号框。
+    document.getElementById("orderNo").value = d.order_no;
     loadState(); loadOrders();
-  } catch (e) { show("submitMsg", e.message, false); }
+  } catch (e) {
+    show("submitMsg",
+      e.type === "ClearedIdempotencyKeyError"
+        ? `✕ ${e.message}\n（旧单已清空，未生成新单，共需清单未改动）`
+        : e.message, false);
+  }
 }
 async function fetchOrder() {
   const no = document.getElementById("orderNo").value.trim();
@@ -180,25 +206,59 @@ async function fetchOrder() {
   try {
     const resp = await fetch(`/api/orders/${encodeURIComponent(no)}`);
     const d = await resp.json();
-    if (!resp.ok) throw new Error(d.error);
-    show("orderMsg", `已重取单号 ${d.order_no}，内容与原单一致`, true);
+    if (!resp.ok) throw new Error(d.error || ("HTTP " + resp.status));
+    show("orderMsg", `已重取单号 ${d.order_no}，内容与原单一致` +
+         (d.generation ? `（清空后第 ${d.generation} 代）` : ""), true);
     document.getElementById("rawBox").textContent = JSON.stringify(d, null, 2);
-  } catch (e) { show("orderMsg", e.message, false); }
+  } catch (e) {
+    show("orderMsg", `✕ ${e.message}`, false);
+    document.getElementById("rawBox").textContent = "（单据不存在）";
+  }
 }
-function downloadOrder() {
+async function downloadOrder() {
   const no = document.getElementById("orderNo").value.trim();
   if (!no) return show("orderMsg", "请填写单号", false);
-  window.open(`/api/orders/${encodeURIComponent(no)}/download`, "_blank");
+  try {
+    const resp = await fetch(`/api/orders/${encodeURIComponent(no)}/download`);
+    if (!resp.ok) {
+      const d = await resp.json().catch(() => ({}));
+      throw new Error(d.error || ("HTTP " + resp.status));
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${no}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    show("orderMsg", `已下载 ${no}.csv`, true);
+  } catch (e) {
+    show("orderMsg", `✕ 下载失败：${e.message}`, false);
+  }
 }
-async function resetAll() {
-  await fetch("/api/reset", { method:"POST" });
+async function doClear(fail) {
+  const headers = fail ? {"X-Fail-Clear": "1"} : {};
+  try {
+    const d = await post("/api/reset", new FormData(), headers);
+    show("resetMsg",
+      `✓ 已清空工位：删除 ${d.removed_orders} 张旧单、${d.removed_idempotency_keys} 个幂等键。\n` +
+      `此后新单进入第 ${d.next_generation} 代（单号带 G${d.next_generation}），旧单号与旧键均已失效。`, true);
+    document.getElementById("rawBox").textContent = "（工位已清空）";
+  } catch (e) {
+    show("resetMsg",
+      `✕ ${e.message}\n（清空失败，原单仍可查询，原幂等键仍可复用）`, false);
+  }
   loadState(); loadOrders();
 }
+function resetAll() { return doClear(false); }
+function resetAllFailing() { return doClear(true); }
 function ident(x) { return `${x.glyph_char}（${x.library_name}/${x.edition}/${x.matrix_no}）`; }
 async function loadState() {
   const d = await (await fetch("/api/state")).json();
   const box = document.getElementById("stateBox");
-  let html = `<p class="muted">当前生效字库：${d.libraries.map(l =>
+  let html = `<p class="muted">当前单号世代：${d.generation
+      ? `第 ${d.generation} 代（清空 ${d.generation} 次，单号带 G${d.generation}）`
+      : "初始世代（尚未清空）"}</p>`;
+  html += `<p class="muted">当前生效字库：${d.libraries.map(l =>
       `${l.name}·${l.edition}(优先级${l.priority})`).join(" → ") || "（未上传）"}</p>`;
   for (const v of d.volumes) {
     html += `<div class="vol"><h3>册「${v.volume}」</h3>
@@ -214,12 +274,13 @@ async function loadOrders() {
   const d = await (await fetch("/api/orders")).json();
   const box = document.getElementById("ordersBox");
   if (!d.length) { box.innerHTML = "<p class='muted'>暂无。</p>"; return; }
-  let html = "<table><tr><th>生效序</th><th>单号</th><th>册</th><th>增</th><th>减</th><th>操作</th></tr>";
+  let html = "<table><tr><th>生效序</th><th>世代</th><th>单号</th><th>册</th><th>增</th><th>减</th><th>操作</th></tr>";
   for (const o of d) {
-    html += `<tr><td>${o.seq}</td><td>${o.order_no}</td><td>${o.volume}</td>
+    html += `<tr><td>${o.seq}</td><td>${o.generation ? "G" + o.generation : "初始"}</td>
+      <td>${o.order_no}</td><td>${o.volume}</td>
       <td><span class="tag add">+${o.added_count}</span></td>
       <td><span class="tag del">-${o.removed_count}</span></td>
-      <td><a href="/api/orders/${o.order_no}/download">CSV</a> ·
+      <td><a href="javascript:void(0)" onclick="document.getElementById('orderNo').value='${o.order_no}';downloadOrder()">CSV</a> ·
       <a href="javascript:void(0)" onclick="document.getElementById('orderNo').value='${o.order_no}';fetchOrder()">JSON</a></td></tr>`;
   }
   box.innerHTML = html + "</table>";

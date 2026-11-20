@@ -1,14 +1,19 @@
-"""核心业务逻辑：字库装载、逐字取字库、交印出单。
+"""核心业务逻辑：字库装载、逐字取字库、交印出单、清空工位。
 
 规则要点
 --------
 1. 每个字取“按优先顺序第一个收录它的字库”，以 (字库, 版次, 字模号) 识别字模。
 2. 交印一册只更新该册选用的字模，其余册沿用各自上次交印的清单。
 3. 比对交印前后“各册共需的字模（并集）”生成增减单。
-4. 交印事务串行化（BEGIN IMMEDIATE + 库内应用级互斥锁），逐单生效，
-   每单提交前后都校验并集与各册清单一致。
+4. 交印、清空共用一把互斥锁并在 `BEGIN IMMEDIATE` 事务中执行，二者重叠时
+   严格按生效次序逐笔处理。
 5. 重复确认同一笔交印复用原单，按单号可原样重取。
 6. 缺字或保存失败时回滚，仍沿用原清单。
+7. 清空工位后：
+   - 字库、分册、旧单内容全部删除，旧单号重取 JSON/下载 CSV 均报“单据不存在”；
+   - 幂等键留下墓碑，旧键重试报“该笔交印已清空”，不出单也不改动共需清单；
+   - 单号进入新一代（`…-G{世代}-…`），序号从 1 重新计，绝不复用清空前的单号；
+   - 清空失败整笔回滚，原单仍可查询、原键仍可复用。
 """
 from __future__ import annotations
 
@@ -19,10 +24,17 @@ import threading
 from datetime import datetime, timezone
 
 from .database import connect, init_db
-from .errors import DomainError, MissingGlyphError, SaveError
+from .errors import (
+    ClearedIdempotencyKeyError,
+    ClearFailureError,
+    DomainError,
+    MissingGlyphError,
+    OrderNotFoundError,
+    SaveError,
+)
 from .parsers import LibraryRow
 
-# 进程内互斥：保证多人同时交印按生效次序逐单出单。
+# 进程内互斥：交印与清空共用，保证二者重叠时按生效次序逐笔处理。
 # 数据库层 BEGIN IMMEDIATE + busy_timeout 则在多进程/多连接下兜底。
 _submit_lock = threading.Lock()
 
@@ -43,6 +55,23 @@ def _ident_key(ident: dict) -> tuple:
 
 def _sorted_idents(idents: list[dict]) -> list[dict]:
     return sorted(idents, key=_ident_key)
+
+
+def _current_generation(conn: sqlite3.Connection) -> int:
+    """当前单号世代：0 表示从未清空，第 n 次清空后为 n。
+
+    generations 来自持久化的 clears 表，服务重启后仍然有效。
+    """
+    return conn.execute("SELECT COALESCE(MAX(clear_id), 0) AS g FROM clears").fetchone()["g"]
+
+
+def _format_order_no(generation: int, seq: int) -> str:
+    """第 0 代沿用旧格式；清空后的世代在单号中带 G{世代}，确保不与旧号重复。"""
+    date = datetime.now().strftime("%Y%m%d")
+    if generation:
+        return f"MO{date}-G{generation}-{seq:06d}"
+    return f"MO{date}-{seq:06d}"
+
 
 
 def replace_libraries(rows: list[LibraryRow]) -> dict:
@@ -217,8 +246,29 @@ def submit_volume(
     fail_commit: bool = False,
 ) -> dict:
     """交印一册，返回增减单（原单复用则 reused=True）。"""
+    idem_key = (idem_key or "").strip() or None  # 空/纯空白键视同未提供
     with _submit_lock:
         return _submit_tx(volume_name, idem_key, fail_commit)
+
+
+def _lookup_cleared_key(conn: sqlite3.Connection, idem_key: str):
+    return conn.execute(
+        "SELECT order_no, volume_name FROM cleared_idempotency_keys WHERE idem_key=?",
+        (idem_key,),
+    ).fetchone()
+
+
+def _next_order_no(conn: sqlite3.Connection) -> tuple[str, int, int]:
+    """在事务内分配下一单号，返回 (单号, 序号, 世代)。
+
+    清空会删除旧单并把 submit_seq 归零，新世代序号从 1 重新计；单号带世代标志
+    G{n}（`MO日期-G{n}-000001`），因此当天重新出首单也绝不会沿用清空前的旧号。
+    世代来自持久化的 clears 表，服务重启后依然把清空前后的单号分开。
+    """
+    generation = _current_generation(conn)
+    next_seq = conn.execute("SELECT seq FROM submit_seq").fetchone()["seq"] + 1
+    conn.execute("UPDATE submit_seq SET seq=?", (next_seq,))
+    return _format_order_no(generation, next_seq), next_seq, generation
 
 
 def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dict:
@@ -229,19 +279,27 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
             "SELECT volume_id FROM volumes WHERE name=?", (volume_name,)
         ).fetchone()
         if vol is None:
+            # 即便目标册已被清空，旧键重试也要给出“该笔交印已清空”，而不是泛泛的 404。
+            if idem_key:
+                cleared = _lookup_cleared_key(conn, idem_key)
+                if cleared is not None:
+                    raise ClearedIdempotencyKeyError(idem_key)
             raise DomainError(f"册“{volume_name}”不存在，请先上传用字表", 404)
         volume_id = vol["volume_id"]
 
-        # 1. 幂等键命中：原样复用
+        # 1. 幂等键命中：原样复用；旧键被清空后则明确拒绝，绝不出新单。
         if idem_key:
+            cleared = _lookup_cleared_key(conn, idem_key)
             old = conn.execute(
                 "SELECT payload_json FROM orders WHERE idem_key=?", (idem_key,)
             ).fetchone()
-            if old is not None:
+            if old is not None and cleared is None:
                 payload = json.loads(old["payload_json"])
                 payload["reused"] = True
                 conn.rollback()
                 return payload
+            if cleared is not None:
+                raise ClearedIdempotencyKeyError(idem_key)
 
         chars = [
             r["glyph_char"]
@@ -309,15 +367,13 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
         # 7. 逐单校验：提交前后共需并集都必须与各册 active 清单一致
         _assert_pool_consistent(conn, "交印后")
 
-        # 8. 单号与落库
-        row = conn.execute("SELECT seq FROM submit_seq").fetchone()
-        next_seq = row["seq"] + 1
-        conn.execute("UPDATE submit_seq SET seq=?", (next_seq,))
-        order_no = f"MO{datetime.now().strftime('%Y%m%d')}-{next_seq:06d}"
+        # 8. 单号与落库（清空后进入新一代，序号重新计，不复用旧号）
+        order_no, next_seq, generation = _next_order_no(conn)
 
         payload = {
             "order_no": order_no,
             "seq": next_seq,
+            "generation": generation,
             "volume": volume_name,
             "idem_key": idem_key,
             "reused": False,
@@ -332,7 +388,7 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
         }
         conn.execute(
             "INSERT INTO orders(order_no, seq, volume_id, volume_name, idem_key, "
-            "fingerprint, payload_json) VALUES (?,?,?,?,?,?,?)",
+            "fingerprint, payload_json, generation) VALUES (?,?,?,?,?,?,?,?)",
             (
                 order_no,
                 next_seq,
@@ -341,6 +397,7 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
                 idem_key,
                 fp,
                 json.dumps(payload, ensure_ascii=False),
+                generation,
             ),
         )
 
@@ -369,7 +426,8 @@ def get_order(order_no: str) -> dict:
             "SELECT payload_json FROM orders WHERE order_no=?", (order_no,)
         ).fetchone()
         if row is None:
-            raise DomainError(f"单号 {order_no} 不存在", 404)
+            # 清空后旧单已被删除，JSON 重取与 CSV 下载都必须明确报“单据不存在”。
+            raise OrderNotFoundError(order_no)
         payload = json.loads(row["payload_json"])
         payload["reused"] = False
         return payload
@@ -382,14 +440,14 @@ def list_orders(volume_name: str | None = None) -> list[dict]:
     try:
         if volume_name:
             rows = conn.execute(
-                "SELECT order_no, seq, volume_name, created_at, payload_json "
-                "FROM orders WHERE volume_name=? ORDER BY seq",
+                "SELECT order_no, seq, volume_name, generation, created_at, payload_json "
+                "FROM orders WHERE volume_name=? ORDER BY generation, seq",
                 (volume_name,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT order_no, seq, volume_name, created_at, payload_json "
-                "FROM orders ORDER BY seq"
+                "SELECT order_no, seq, volume_name, generation, created_at, payload_json "
+                "FROM orders ORDER BY generation, seq"
             ).fetchall()
         result = []
         for r in rows:
@@ -398,6 +456,7 @@ def list_orders(volume_name: str | None = None) -> list[dict]:
                 {
                     "order_no": r["order_no"],
                     "seq": r["seq"],
+                    "generation": r["generation"],
                     "volume": r["volume_name"],
                     "created_at": r["created_at"],
                     "added_count": len(p["added"]),
@@ -435,34 +494,122 @@ def get_state() -> dict:
                 {"volume": v["name"], "chars": chars, "active_matrices": active}
             )
         pool = _load_pool(conn)
-        return {"libraries": libs, "volumes": volumes, "shared_pool": pool}
+        clears = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT clear_id, cleared_seq, cleared_at FROM clears ORDER BY clear_id"
+            ).fetchall()
+        ]
+        return {
+            "libraries": libs,
+            "volumes": volumes,
+            "shared_pool": pool,
+            "generation": _current_generation(conn),
+            "clears": clears,
+        }
     finally:
         conn.close()
 
 
-def reset_all() -> None:
-    """清空全部业务数据（开发/演示用）。"""
-    conn = connect()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        for table in (
-            "orders",
-            "active_matrices",
-            "volume_chars",
-            "volumes",
-            "glyphs",
-            "libraries",
-        ):
-            conn.execute(f"DELETE FROM {table}")
-        conn.execute("UPDATE submit_seq SET seq=0")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+def reset_all(fail_clear: bool = False) -> dict:
+    """清空工位：删除字库、分册、旧单内容，并让旧单号/旧幂等键永久失效。
+
+    与交印共用同一把互斥锁和 `BEGIN IMMEDIATE` 事务：二者重叠时严格按生效次序
+    逐笔处理（谁先拿到事务谁先生效），不会出现“清空删一半又被交印写回”的交错。
+    清空失败时整笔回滚，原单仍可查询、原键仍可复用。
+    """
+    with _submit_lock:
+        conn = connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # 1. 旧单的幂等键先立墓碑（在删除订单之前读取），旧键重试据此被拒绝。
+            old_keys = conn.execute(
+                "SELECT idem_key, order_no, volume_name FROM orders "
+                "WHERE idem_key IS NOT NULL"
+            ).fetchall()
+            cleared_seq = conn.execute("SELECT seq FROM submit_seq").fetchone()["seq"]
+            cur = conn.execute(
+                "INSERT INTO clears(cleared_seq, cleared_at) VALUES (?, ?)",
+                (cleared_seq, _now_iso()),
+            )
+            clear_id = cur.lastrowid
+            for k in old_keys:
+                conn.execute(
+                    "INSERT OR REPLACE INTO cleared_idempotency_keys"
+                    "(idem_key, order_no, volume_name, clear_id, cleared_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (k["idem_key"], k["order_no"], k["volume_name"], clear_id, _now_iso()),
+                )
+            # 2. 删除旧单内容、各册已交印清单、用字、分册、字模、字库。
+            removed_orders = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+            for table in (
+                "orders",
+                "active_matrices",
+                "volume_chars",
+                "volumes",
+                "glyphs",
+                "libraries",
+            ):
+                conn.execute(f"DELETE FROM {table}")
+            # 3. 序号进入新一代：submit_seq 归零，新世代的单号带 G{clear_id} 前缀，
+            #    即便当天重新出首单也绝不沿用清空前的旧号。
+            conn.execute("UPDATE submit_seq SET seq=0")
+            if fail_clear:
+                # 测试钩子：模拟清空落库失败。
+                raise ClearFailureError("模拟清空失败（测试）")
+            conn.commit()
+            return {
+                "status": "cleared",
+                "clear_id": clear_id,
+                "removed_orders": removed_orders,
+                "removed_idempotency_keys": len(old_keys),
+                "next_generation": clear_id,
+                "cleared_at": _now_iso(),
+            }
+        except DomainError:
+            conn.rollback()
+            raise
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            raise ClearFailureError(f"清空失败，已回滚，原单仍可查询和复用: {exc}")
+        except Exception:
+            conn.rollback()
+            raise ClearFailureError()
+        finally:
+            conn.close()
 
 
 def ensure_db() -> None:
     """建表并初始化序号（连接时会自动创建数据目录）。"""
     init_db()
+
+
+def purge_all() -> None:
+    """仅供测试/本地开发：连清空历史与幂等键墓碑一并抹掉，回到全新库状态。
+
+    与面向用户的“清空工位”(reset_all) 不同——后者必须保留清空记录与旧键墓碑，
+    以便旧单号、旧键在重启后仍被识别为已清空。
+    """
+    with _submit_lock:
+        conn = connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for table in (
+                "cleared_idempotency_keys",
+                "clears",
+                "orders",
+                "active_matrices",
+                "volume_chars",
+                "volumes",
+                "glyphs",
+                "libraries",
+            ):
+                conn.execute(f"DELETE FROM {table}")
+            conn.execute("DELETE FROM sqlite_sequence")
+            conn.execute("UPDATE submit_seq SET seq=0")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()

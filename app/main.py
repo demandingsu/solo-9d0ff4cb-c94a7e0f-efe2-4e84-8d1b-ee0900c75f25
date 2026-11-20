@@ -108,6 +108,8 @@ def _order_csv(payload: dict) -> str:
 
 @app.get("/api/orders/{order_no}/download", summary="下载增减单 CSV")
 def order_download(order_no: str):
+    # 清空后旧单已被删除：JSON 重取与 CSV 下载都由统一异常处理返回 404「单据不存在」，
+    # 因此下载链接不可能拿到清空后新出的单。
     payload = service.get_order(order_no)
     csv_text = _order_csv(payload)
     return Response(
@@ -127,10 +129,12 @@ def state():
     return service.get_state()
 
 
-@app.post("/api/reset", summary="清空全部数据（演示用）")
-def reset():
-    service.reset_all()
-    return {"status": "reset"}
+@app.post("/api/reset", summary="清空工位（字库、分册、旧单内容）")
+def reset(
+    x_fail_clear: str | None = Header(default=None, alias="X-Fail-Clear"),
+):
+    fail = (x_fail_clear or "").lower() in ("1", "true", "yes")
+    return service.reset_all(fail_clear=fail)
 
 
 # ---------- 网页 ----------
